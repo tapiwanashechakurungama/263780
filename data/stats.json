@@ -1,0 +1,25 @@
+{
+  "users": {
+    "143972152393831@lid": {
+      "gamesPlayed": 1,
+      "wins": 1,
+      "losses": 0,
+      "draws": 0,
+      "streak": 1,
+      "bestStreak": 1,
+      "perGame": {
+        "guess": {
+          "wins": 1,
+          "losses": 0,
+          "draws": 0
+        }
+      },
+      "createdAt": 1791805353110,
+      "greeted": true,
+      "mode": "bot",
+      "nashyQueue": null,
+      "nashyNotified": false,
+      "nashyNotifiedAt": 0
+    }
+  }
+}
