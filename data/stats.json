@@ -20,6 +20,17 @@
       "nashyQueue": null,
       "nashyNotified": false,
       "nashyNotifiedAt": 0
+    },
+    "16188419641455@lid": {
+      "createdAt": 1793740379169,
+      "greeted": true,
+      "mode": "nashy",
+      "nashyQueue": {
+        "since": 1793740403099,
+        "served": false
+      },
+      "nashyNotified": true,
+      "nashyNotifiedAt": 1793740403108
     }
   }
 }
