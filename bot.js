@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WhatsApp Bot — Final
+// WhatsApp Bot — Final (with self-ping keep-alive)
 // Always Online | Anti-Delete (groups) | Auto-View Status
 // ═══════════════════════════════════════════════════════════
 const {
@@ -44,6 +44,13 @@ const STATUS_MIN_DELAY  = 2000;
 const STATUS_MAX_DELAY  = 5000;
 const STATUS_BLACKLIST  = new Set([]);
 const STATUS_REACT_EMOJIS = ['🔥','❤️','👏','💯','🙌','😂','😮','✨'];
+
+// Self-ping config
+const SELF_PING_INTERVAL_MS = 10 * 60 * 1000; // every 10 minutes
+const SELF_PING_URL = process.env.SELF_PING_URL ||
+                      (process.env.RENDER_EXTERNAL_URL
+                        ? `${process.env.RENDER_EXTERNAL_URL}/health`
+                        : null);
 
 const LOGGER = pino({ level: 'silent' });
 
@@ -219,6 +226,28 @@ app.get('/health', (req, res) => {
 });
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Health server on :${PORT}`));
+
+// ═══════════════════════════════════════════════════════════
+// 5b. SELF-PING (prevents Render free-tier sleep)
+// ═══════════════════════════════════════════════════════════
+if (SELF_PING_URL) {
+  console.log(`🔄 Self-ping enabled: ${SELF_PING_URL} every ${SELF_PING_INTERVAL_MS / 60000} min`);
+
+  const ping = async () => {
+    try {
+      const res = await fetch(SELF_PING_URL, { method: 'GET' });
+      console.log(`🔄 Self-ping OK (${res.status}) → ${SELF_PING_URL}`);
+    } catch (e) {
+      console.error('🔄 Self-ping failed:', e.message);
+    }
+  };
+
+  // Wait 30s after boot before first ping (let the service stabilize)
+  setTimeout(ping, 30_000);
+  setInterval(ping, SELF_PING_INTERVAL_MS);
+} else {
+  console.log('ℹ️ Self-ping disabled (set SELF_PING_URL or RENDER_EXTERNAL_URL to enable)');
+}
 
 // ═══════════════════════════════════════════════════════════
 // 6. BOT BOOTSTRAP
