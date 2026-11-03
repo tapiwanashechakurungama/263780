@@ -1,6 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WhatsApp Bot — Final (with self-ping keep-alive)
-// Always Online | Anti-Delete (groups) | Auto-View Status
+// WhatsApp Bot — Final (Web QR + Self-Ping + Auto-View + Anti-Delete)
 // ═══════════════════════════════════════════════════════════
 const {
   default: makeWASocket,
@@ -11,13 +10,14 @@ const {
   proto
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
 
 // ═══════════════════════════════════════════════════════════
-// GLOBAL ERROR HANDLERS (prevents undici ECONNRESET crash)
+// GLOBAL ERROR HANDLERS
 // ═══════════════════════════════════════════════════════════
 process.on('uncaughtException', (err) => {
   console.error('⚠️ Uncaught Exception (kept alive):', err.message);
@@ -45,8 +45,7 @@ const STATUS_MAX_DELAY  = 5000;
 const STATUS_BLACKLIST  = new Set([]);
 const STATUS_REACT_EMOJIS = ['🔥','❤️','👏','💯','🙌','😂','😮','✨'];
 
-// Self-ping config
-const SELF_PING_INTERVAL_MS = 10 * 60 * 1000; // every 10 minutes
+const SELF_PING_INTERVAL_MS = 10 * 60 * 1000;
 const SELF_PING_URL = process.env.SELF_PING_URL ||
                       (process.env.RENDER_EXTERNAL_URL
                         ? `${process.env.RENDER_EXTERNAL_URL}/health`
@@ -54,15 +53,18 @@ const SELF_PING_URL = process.env.SELF_PING_URL ||
 
 const LOGGER = pino({ level: 'silent' });
 
+// Runtime state
+let currentQR = null;
+let botConnected = false;
+
 // ═══════════════════════════════════════════════════════════
-// 1. MESSAGE STORE (for anti-delete only)
+// 1. MESSAGE STORE
 // ═══════════════════════════════════════════════════════════
-const messageStore = new Map(); // id -> { message, storedAt }
+const messageStore = new Map();
 
 function storeMessage(m) {
   if (!m.message || !m.key.id) return;
   const now = Date.now();
-
   messageStore.set(m.key.id, { message: m, storedAt: now });
 
   if (messageStore.size > STORE_MAX_ENTRIES) {
@@ -104,7 +106,7 @@ function getSenderName(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 3. ANTI-DELETE FORWARDER
+// 3. ANTI-DELETE
 // ═══════════════════════════════════════════════════════════
 async function forwardDeleted(sock, original) {
   if (!FEATURES.antiDelete) return;
@@ -212,41 +214,84 @@ async function processStatusQueue(sock) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 5. HTTP HEALTH SERVER
+// 5. HTTP SERVER (health + web QR)
 // ═══════════════════════════════════════════════════════════
 const app = express();
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
+    connected: botConnected,
     uptime: process.uptime(),
     storeSize: messageStore.size,
     features: FEATURES,
     timestamp: new Date().toISOString()
   });
 });
+
+// QR page (scan from phone browser)
+app.get('/qr', async (req, res) => {
+  if (botConnected) {
+    return res.send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#111;color:#0f0;">
+        <h2>✅ Bot already connected</h2>
+        <p>No QR needed. WhatsApp is linked.</p>
+      </body></html>
+    `);
+  }
+  if (!currentQR) {
+    return res.send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#111;color:#fff;">
+        <h2>⏳ Waiting for QR...</h2>
+        <p>No QR available yet. Refresh in a few seconds.</p>
+        <script>setTimeout(()=>location.reload(), 3000);</script>
+      </body></html>
+    `);
+  }
+  try {
+    const dataUrl = await QRCode.toDataURL(currentQR, {
+      width: 500,
+      margin: 2,
+      errorCorrectionLevel: 'M'
+    });
+    res.send(`
+      <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+      <style>body{font-family:sans-serif;text-align:center;background:#111;color:#fff;padding:20px;margin:0}
+      img{background:#fff;padding:20px;border-radius:12px;max-width:90vw;height:auto}
+      h2{margin:10px 0}</style></head>
+      <body>
+        <h2>📱 Scan with WhatsApp</h2>
+        <p>Linked Devices → Link a Device</p>
+        <img src="${dataUrl}" alt="QR code" />
+        <p style="color:#888;font-size:12px;margin-top:20px;">Page auto-refreshes in 45s to catch new QR</p>
+        <script>setTimeout(()=>location.reload(), 45000);</script>
+      </body></html>
+    `);
+  } catch (e) {
+    res.status(500).send('QR generation failed: ' + e.message);
+  }
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🌐 Health server on :${PORT}`));
+app.listen(PORT, () => console.log(`🌐 Server on :${PORT} — QR at /qr`));
 
 // ═══════════════════════════════════════════════════════════
-// 5b. SELF-PING (prevents Render free-tier sleep)
+// 5b. SELF-PING
 // ═══════════════════════════════════════════════════════════
 if (SELF_PING_URL) {
   console.log(`🔄 Self-ping enabled: ${SELF_PING_URL} every ${SELF_PING_INTERVAL_MS / 60000} min`);
-
   const ping = async () => {
     try {
       const res = await fetch(SELF_PING_URL, { method: 'GET' });
-      console.log(`🔄 Self-ping OK (${res.status}) → ${SELF_PING_URL}`);
+      console.log(`🔄 Self-ping OK (${res.status})`);
     } catch (e) {
       console.error('🔄 Self-ping failed:', e.message);
     }
   };
-
-  // Wait 30s after boot before first ping (let the service stabilize)
   setTimeout(ping, 30_000);
   setInterval(ping, SELF_PING_INTERVAL_MS);
 } else {
-  console.log('ℹ️ Self-ping disabled (set SELF_PING_URL or RENDER_EXTERNAL_URL to enable)');
+  console.log('ℹ️ Self-ping disabled');
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -262,7 +307,9 @@ async function startBot() {
     printQRInTerminal: false,
     logger: LOGGER,
     markOnlineOnConnect: true,
-    syncFullHistory: false
+    syncFullHistory: false,
+    // CRITICAL: allow non-FULL history sync so LID mappings populate
+    shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -271,13 +318,17 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
-      console.clear();
-      console.log('📱 Scan QR:\n');
-      qrcode.generate(qr, { small: true });
+      currentQR = qr;
+      botConnected = false;
+      console.log(`📱 QR ready — open /qr in browser to scan`);
+      // Optionally still print small terminal QR for local dev
+      if (!process.env.RENDER) qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'open') {
       reconnectAttempts = 0;
+      botConnected = true;
+      currentQR = null;
       console.log('✅ Connected!');
       console.log('🤖 Features:', FEATURES);
 
@@ -289,6 +340,7 @@ async function startBot() {
     }
 
     if (connection === 'close') {
+      botConnected = false;
       if (presenceInterval) { clearInterval(presenceInterval); presenceInterval = null; }
 
       const code = lastDisconnect?.error?.output?.statusCode;
@@ -315,7 +367,7 @@ async function startBot() {
         const jid = m.key.remoteJid;
         if (!jid) continue;
 
-        // ── Auto-view status ──
+        // Auto-view status
         if (jid === 'status@broadcast') {
           if (!FEATURES.autoViewStatus) continue;
           const senderJid = m.key.participant;
@@ -335,10 +387,8 @@ async function startBot() {
           continue;
         }
 
-        // ── Skip newsletters ──
         if (jid.endsWith('@newsletter')) continue;
 
-        // ── Store all messages (private + groups) for anti-delete ──
         storeMessage(m);
       } catch (e) {
         console.error('upsert handler error:', e.message);
