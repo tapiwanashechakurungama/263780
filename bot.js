@@ -17,7 +17,7 @@ const path = require('path');
 const pino = require('pino');
 
 // ═══════════════════════════════════════════════════════════
-// GLOBAL ERROR HANDLERS  (now log stack traces)
+// GLOBAL ERROR HANDLERS
 // ═══════════════════════════════════════════════════════════
 process.on('uncaughtException', (err) => {
   console.error('⚠️ Uncaught Exception (kept alive):', err.stack || err);
@@ -51,18 +51,24 @@ const SELF_PING_URL = process.env.SELF_PING_URL ||
                         ? `${process.env.RENDER_EXTERNAL_URL}/health`
                         : null);
 
-// 🔧 bumped to 'error' so Baileys internal warnings are visible without spam.
-//    Set DEBUG_BAILEYS=1 to get full debug logs when needed.
 const LOGGER = pino({ level: process.env.DEBUG_BAILEYS === '1' ? 'debug' : 'error' });
 
 // Runtime state
-let currentQR = null;
-let botConnected = false;
-let activeSock = null;
-let starting = false;
+let currentQR        = null;
+let qrEmittedAt      = 0;
+let botConnected     = false;
+let activeSock       = null;
+let starting         = false;
+let restartTimer     = null;
+let reconnectAttempts = 0;
+let presenceInterval  = null;
+let socketGeneration  = 0;
+let hasEverAuthenticated = false;
+let permanentlyStopped   = false;
+let botStartedAt         = 0;
 
 // ═══════════════════════════════════════════════════════════
-// 0. CREDS HEALTH CHECK  (guards against corrupt creds.json)
+// 0. CREDS HEALTH CHECK
 // ═══════════════════════════════════════════════════════════
 (function checkCreds() {
   const credsPath = path.join('auth_info', 'creds.json');
@@ -282,8 +288,8 @@ app.get('/qr', async (req, res) => {
         <h2>📱 Scan with WhatsApp</h2>
         <p>Linked Devices → Link a Device</p>
         <img src="${dataUrl}" alt="QR code" />
-        <p style="color:#888;font-size:12px;margin-top:20px;">Page auto-refreshes in 45s to catch new QR</p>
-        <script>setTimeout(()=>location.reload(), 45000);</script>
+        <p style="color:#888;font-size:12px;margin-top:20px;">Page auto-refreshes in 30s to catch new QR</p>
+        <script>setTimeout(()=>location.reload(), 30000);</script>
       </body></html>
     `);
   } catch (e) {
@@ -316,25 +322,23 @@ if (SELF_PING_URL) {
 // ═══════════════════════════════════════════════════════════
 // 6. BOT BOOTSTRAP
 // ═══════════════════════════════════════════════════════════
-let reconnectAttempts = 0;
-let presenceInterval = null;
-let restartTimer = null;
-
 async function startBot() {
-  // 🔒 Prevent overlapping sockets (main cause of cascading disconnects)
-  if (starting) {
-    console.log('⏳ startBot already in progress — skipping');
-    return;
-  }
+  if (starting || permanentlyStopped) return;
   starting = true;
+  botStartedAt = Date.now();
 
   try {
-    // Close any previous socket cleanly before creating a new one
+    // Increment generation BEFORE touching the old socket — its close event
+    // will now be ignored by the generation check.
+    socketGeneration++;
+    const myGen = socketGeneration;
+
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+
     if (activeSock) {
       try { activeSock.end(undefined); } catch {}
       activeSock = null;
     }
-    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
 
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     const sock = makeWASocket({
@@ -343,14 +347,8 @@ async function startBot() {
       logger: LOGGER,
       markOnlineOnConnect: true,
       syncFullHistory: false,
-      // 🔧 keep-alive + timeouts tuned for free hosts (Render/Heroku/Koyeb)
-      keepAliveIntervalMs: 30_000,
-      connectTimeoutMs: 60_000,
-      retryRequestDelayMs: 2_000,
-      defaultQueryTimeoutMs: 60_000,
-      // 🔧 stable browser identity avoids "unsupported client" drops
-      browser: ['Ubuntu', 'Chrome', '120.0.0'],
-      // 🔧 allow non-FULL history sync so LID mappings populate (unchanged behaviour)
+      // (browser config intentionally omitted — hardcoded values can be
+      //  rejected by WhatsApp and cause an immediate close right after QR)
       shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2
     });
 
@@ -359,24 +357,33 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (u) => {
+      // ── Ignore events from stale sockets ──
+      if (myGen !== socketGeneration) {
+        console.log(`🚫 Ignoring update from stale socket gen=${myGen} (current=${socketGeneration})`);
+        return;
+      }
+
       const { connection, lastDisconnect, qr } = u;
 
       if (qr) {
         currentQR = qr;
+        qrEmittedAt = Date.now();
         botConnected = false;
-        console.log(`📱 QR ready — open /qr in browser to scan`);
+        reconnectAttempts = 0; // QR refresh is normal — not a failure
+        console.log(`📱 QR ready (gen=${myGen}) — open /qr in browser to scan`);
         if (!process.env.RENDER) qrcode.generate(qr, { small: true });
       }
 
       if (connection === 'open') {
+        hasEverAuthenticated = true;
         reconnectAttempts = 0;
         botConnected = true;
         currentQR = null;
+        qrEmittedAt = 0;
         console.log('✅ Connected!');
         console.log('🤖 Features:', FEATURES);
 
         if (presenceInterval) clearInterval(presenceInterval);
-        // 🔧 presence ping every 10 min (was 45s — this was rate-limiting WhatsApp)
         presenceInterval = setInterval(async () => {
           try { await sock.sendPresenceUpdate('available'); } catch {}
         }, 10 * 60 * 1000);
@@ -387,21 +394,25 @@ async function startBot() {
         botConnected = false;
         if (presenceInterval) { clearInterval(presenceInterval); presenceInterval = null; }
 
-        const code = lastDisconnect?.error?.output?.statusCode;
-        // 🔧 Log the FULL reason so the disconnect cause is visible
+        const code   = lastDisconnect?.error?.output?.statusCode;
+        const qrAge  = qrEmittedAt ? Date.now() - qrEmittedAt : null;
+
         console.error('❌ Connection closed:', {
+          gen: myGen,
           code,
+          qrAgeMs: qrAge,
           reason: lastDisconnect?.error?.output?.payload?.message,
           message: lastDisconnect?.error?.message
         });
 
-        // 🚪 Logged out — auth invalid, do NOT loop reconnect
+        // 🚪 Logged out — truly stop, do not loop
         if (code === DisconnectReason.loggedOut) {
+          permanentlyStopped = true;
           console.log('🚪 Logged out. Delete auth_info/ and restart to re-scan QR.');
           return;
         }
 
-        // ♻️ 515 = restartRequired — Baileys expects an IMMEDIATE reconnect
+        // ♻️ 515 restartRequired — reconnect fast, no backoff
         if (code === DisconnectReason.restartRequired) {
           console.log('♻️ restartRequired — reconnecting immediately');
           restartTimer = setTimeout(() => {
@@ -411,7 +422,19 @@ async function startBot() {
           return;
         }
 
-        // Hard cap on rapid reconnects to avoid hammering WhatsApp
+        // 📱 QR phase — give the user time to scan, do NOT use backoff yet.
+        //    5s delay between QR refreshes = plenty of time to scan, and
+        //    slow enough to avoid WhatsApp rate-limiting.
+        if (!hasEverAuthenticated) {
+          console.log('📱 QR phase — reconnecting in 5s to refresh QR');
+          restartTimer = setTimeout(() => {
+            restartTimer = null;
+            startBot().catch(e => console.error('QR-phase reconnect error:', e));
+          }, 5000);
+          return;
+        }
+
+        // 🔁 Post-auth — normal exponential backoff
         reconnectAttempts++;
         if (reconnectAttempts > 6) {
           console.warn('🛑 Too many reconnects — cooling down 5 min');
@@ -434,6 +457,7 @@ async function startBot() {
 
     // ── Incoming messages ──
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (myGen !== socketGeneration) return;
       if (type !== 'notify') return;
 
       for (const m of messages) {
@@ -442,7 +466,6 @@ async function startBot() {
           const jid = m.key.remoteJid;
           if (!jid) continue;
 
-          // Auto-view status
           if (jid === 'status@broadcast') {
             if (!FEATURES.autoViewStatus) continue;
             const senderJid = m.key.participant;
@@ -473,6 +496,7 @@ async function startBot() {
 
     // ── Anti-delete ──
     sock.ev.on('messages.update', async (updates) => {
+      if (myGen !== socketGeneration) return;
       if (!FEATURES.antiDelete) return;
       for (const update of updates) {
         try {
@@ -506,13 +530,17 @@ async function startBot() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 6b. WATCHDOG  (catches silent socket deaths on free hosts)
+// 6b. WATCHDOG (with grace period so it can't kill initial connect)
 // ═══════════════════════════════════════════════════════════
 setInterval(() => {
-  if (!botConnected && !starting && !restartTimer) {
-    console.warn('⏰ Watchdog: not connected — restarting bot');
-    startBot().catch(e => console.error('watchdog restart error:', e));
-  }
+  if (permanentlyStopped) return;
+  if (botConnected || starting || restartTimer) return;
+  // Do not fire for the first 2 minutes after the last startBot() — gives
+  // slow free-tier hosts time to establish the socket without interference.
+  if (botStartedAt && Date.now() - botStartedAt < 120_000) return;
+
+  console.warn('⏰ Watchdog: not connected — restarting bot');
+  startBot().catch(e => console.error('watchdog restart error:', e));
 }, 60_000);
 
 // ═══════════════════════════════════════════════════════════
