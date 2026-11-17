@@ -328,8 +328,6 @@ async function startBot() {
   botStartedAt = Date.now();
 
   try {
-    // Increment generation BEFORE touching the old socket — its close event
-    // will now be ignored by the generation check.
     socketGeneration++;
     const myGen = socketGeneration;
 
@@ -347,9 +345,11 @@ async function startBot() {
       logger: LOGGER,
       markOnlineOnConnect: true,
       syncFullHistory: false,
-      // (browser config intentionally omitted — hardcoded values can be
-      //  rejected by WhatsApp and cause an immediate close right after QR)
-      shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2
+      // 🔧 FIX: Only reject FULL history sync. Rejecting all sync types
+      //    except "2" can prevent LID mappings from populating, which
+      //    silently drops inbound messages (one-gray-tick symptom).
+      shouldSyncHistoryMessage: ({ syncType }) =>
+        syncType !== proto.HistorySync.HistorySyncType.FULL
     });
 
     activeSock = sock;
@@ -357,11 +357,7 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (u) => {
-      // ── Ignore events from stale sockets ──
-      if (myGen !== socketGeneration) {
-        console.log(`🚫 Ignoring update from stale socket gen=${myGen} (current=${socketGeneration})`);
-        return;
-      }
+      if (myGen !== socketGeneration) return;
 
       const { connection, lastDisconnect, qr } = u;
 
@@ -369,7 +365,7 @@ async function startBot() {
         currentQR = qr;
         qrEmittedAt = Date.now();
         botConnected = false;
-        reconnectAttempts = 0; // QR refresh is normal — not a failure
+        reconnectAttempts = 0;
         console.log(`📱 QR ready (gen=${myGen}) — open /qr in browser to scan`);
         if (!process.env.RENDER) qrcode.generate(qr, { small: true });
       }
@@ -405,14 +401,12 @@ async function startBot() {
           message: lastDisconnect?.error?.message
         });
 
-        // 🚪 Logged out — truly stop, do not loop
         if (code === DisconnectReason.loggedOut) {
           permanentlyStopped = true;
           console.log('🚪 Logged out. Delete auth_info/ and restart to re-scan QR.');
           return;
         }
 
-        // ♻️ 515 restartRequired — reconnect fast, no backoff
         if (code === DisconnectReason.restartRequired) {
           console.log('♻️ restartRequired — reconnecting immediately');
           restartTimer = setTimeout(() => {
@@ -422,9 +416,6 @@ async function startBot() {
           return;
         }
 
-        // 📱 QR phase — give the user time to scan, do NOT use backoff yet.
-        //    5s delay between QR refreshes = plenty of time to scan, and
-        //    slow enough to avoid WhatsApp rate-limiting.
         if (!hasEverAuthenticated) {
           console.log('📱 QR phase — reconnecting in 5s to refresh QR');
           restartTimer = setTimeout(() => {
@@ -434,7 +425,6 @@ async function startBot() {
           return;
         }
 
-        // 🔁 Post-auth — normal exponential backoff
         reconnectAttempts++;
         if (reconnectAttempts > 6) {
           console.warn('🛑 Too many reconnects — cooling down 5 min');
@@ -462,10 +452,42 @@ async function startBot() {
 
       for (const m of messages) {
         try {
-          if (!m.message || m.key.fromMe) continue;
+          if (!m.message) continue;
+
+          // 🔧 FIX: Log EVERY incoming message BEFORE any filter, so you can
+          //    confirm whether the message actually reaches the handler.
+          console.log('📨 incoming:', {
+            fromMe: m.key.fromMe,
+            jid: m.key.remoteJid,
+            id: m.key.id,
+            type: Object.keys(m.message)[0]
+          });
+
+          // 🔧 FIX: Do not filter on `m.key.fromMe` alone — a Baileys bug can
+          //    deliver messages from other numbers with fromMe=true, causing
+          //    them to be dropped silently. Filter by remoteJid instead.
           const jid = m.key.remoteJid;
           if (!jid) continue;
+          const myJid = sock.user?.id;
+          if (myJid && jid === myJid) continue;
 
+          // ── Send delivery receipt (second gray tick) ──
+          // Baileys 7.x dispatches receipts internally after decryption, but
+          // if your socket was in a stale state when the message arrived, the
+          // internal dispatch can be skipped. Sending explicitly here guarantees
+          // the sender sees the second tick.
+          try {
+            await sock.sendReceipt(
+              jid,
+              m.key.participant || undefined,
+              [m.key.id],
+              'delivery'
+            );
+          } catch (e) {
+            console.error('delivery receipt failed:', e.message);
+          }
+
+          // Auto-view status
           if (jid === 'status@broadcast') {
             if (!FEATURES.autoViewStatus) continue;
             const senderJid = m.key.participant;
@@ -530,13 +552,11 @@ async function startBot() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 6b. WATCHDOG (with grace period so it can't kill initial connect)
+// 6b. WATCHDOG (with grace period)
 // ═══════════════════════════════════════════════════════════
 setInterval(() => {
   if (permanentlyStopped) return;
   if (botConnected || starting || restartTimer) return;
-  // Do not fire for the first 2 minutes after the last startBot() — gives
-  // slow free-tier hosts time to establish the socket without interference.
   if (botStartedAt && Date.now() - botStartedAt < 120_000) return;
 
   console.warn('⏰ Watchdog: not connected — restarting bot');
