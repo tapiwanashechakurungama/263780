@@ -17,13 +17,13 @@ const path = require('path');
 const pino = require('pino');
 
 // ═══════════════════════════════════════════════════════════
-// GLOBAL ERROR HANDLERS
+// GLOBAL ERROR HANDLERS  (now log stack traces)
 // ═══════════════════════════════════════════════════════════
 process.on('uncaughtException', (err) => {
-  console.error('⚠️ Uncaught Exception (kept alive):', err.message);
+  console.error('⚠️ Uncaught Exception (kept alive):', err.stack || err);
 });
 process.on('unhandledRejection', (reason) => {
-  console.error('⚠️ Unhandled Rejection (kept alive):', reason);
+  console.error('⚠️ Unhandled Rejection (kept alive):', reason?.stack || reason);
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -51,11 +51,30 @@ const SELF_PING_URL = process.env.SELF_PING_URL ||
                         ? `${process.env.RENDER_EXTERNAL_URL}/health`
                         : null);
 
-const LOGGER = pino({ level: 'silent' });
+// 🔧 bumped to 'error' so Baileys internal warnings are visible without spam.
+//    Set DEBUG_BAILEYS=1 to get full debug logs when needed.
+const LOGGER = pino({ level: process.env.DEBUG_BAILEYS === '1' ? 'debug' : 'error' });
 
 // Runtime state
 let currentQR = null;
 let botConnected = false;
+let activeSock = null;
+let starting = false;
+
+// ═══════════════════════════════════════════════════════════
+// 0. CREDS HEALTH CHECK  (guards against corrupt creds.json)
+// ═══════════════════════════════════════════════════════════
+(function checkCreds() {
+  const credsPath = path.join('auth_info', 'creds.json');
+  if (!fs.existsSync(credsPath)) return;
+  try {
+    JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+  } catch (e) {
+    const bak = `${credsPath}.bak.${Date.now()}`;
+    console.error(`💥 Corrupt creds.json — moving to ${bak}: ${e.message}`);
+    try { fs.renameSync(credsPath, bak); } catch {}
+  }
+})();
 
 // ═══════════════════════════════════════════════════════════
 // 1. MESSAGE STORE
@@ -299,137 +318,214 @@ if (SELF_PING_URL) {
 // ═══════════════════════════════════════════════════════════
 let reconnectAttempts = 0;
 let presenceInterval = null;
+let restartTimer = null;
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: LOGGER,
-    markOnlineOnConnect: true,
-    syncFullHistory: false,
-    // CRITICAL: allow non-FULL history sync so LID mappings populate
-    shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2
-  });
+  // 🔒 Prevent overlapping sockets (main cause of cascading disconnects)
+  if (starting) {
+    console.log('⏳ startBot already in progress — skipping');
+    return;
+  }
+  starting = true;
 
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', (u) => {
-    const { connection, lastDisconnect, qr } = u;
-
-    if (qr) {
-      currentQR = qr;
-      botConnected = false;
-      console.log(`📱 QR ready — open /qr in browser to scan`);
-      // Optionally still print small terminal QR for local dev
-      if (!process.env.RENDER) qrcode.generate(qr, { small: true });
+  try {
+    // Close any previous socket cleanly before creating a new one
+    if (activeSock) {
+      try { activeSock.end(undefined); } catch {}
+      activeSock = null;
     }
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
 
-    if (connection === 'open') {
-      reconnectAttempts = 0;
-      botConnected = true;
-      currentQR = null;
-      console.log('✅ Connected!');
-      console.log('🤖 Features:', FEATURES);
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: LOGGER,
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+      // 🔧 keep-alive + timeouts tuned for free hosts (Render/Heroku/Koyeb)
+      keepAliveIntervalMs: 30_000,
+      connectTimeoutMs: 60_000,
+      retryRequestDelayMs: 2_000,
+      defaultQueryTimeoutMs: 60_000,
+      // 🔧 stable browser identity avoids "unsupported client" drops
+      browser: ['Ubuntu', 'Chrome', '120.0.0'],
+      // 🔧 allow non-FULL history sync so LID mappings populate (unchanged behaviour)
+      shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2
+    });
 
-      if (presenceInterval) clearInterval(presenceInterval);
-      presenceInterval = setInterval(async () => {
-        try { await sock.sendPresenceUpdate('available'); } catch {}
-      }, 45000);
-      sock.sendPresenceUpdate('available').catch(() => {});
-    }
+    activeSock = sock;
 
-    if (connection === 'close') {
-      botConnected = false;
-      if (presenceInterval) { clearInterval(presenceInterval); presenceInterval = null; }
+    sock.ev.on('creds.update', saveCreds);
 
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
+    sock.ev.on('connection.update', (u) => {
+      const { connection, lastDisconnect, qr } = u;
 
-      if (shouldReconnect) {
+      if (qr) {
+        currentQR = qr;
+        botConnected = false;
+        console.log(`📱 QR ready — open /qr in browser to scan`);
+        if (!process.env.RENDER) qrcode.generate(qr, { small: true });
+      }
+
+      if (connection === 'open') {
+        reconnectAttempts = 0;
+        botConnected = true;
+        currentQR = null;
+        console.log('✅ Connected!');
+        console.log('🤖 Features:', FEATURES);
+
+        if (presenceInterval) clearInterval(presenceInterval);
+        // 🔧 presence ping every 10 min (was 45s — this was rate-limiting WhatsApp)
+        presenceInterval = setInterval(async () => {
+          try { await sock.sendPresenceUpdate('available'); } catch {}
+        }, 10 * 60 * 1000);
+        sock.sendPresenceUpdate('available').catch(() => {});
+      }
+
+      if (connection === 'close') {
+        botConnected = false;
+        if (presenceInterval) { clearInterval(presenceInterval); presenceInterval = null; }
+
+        const code = lastDisconnect?.error?.output?.statusCode;
+        // 🔧 Log the FULL reason so the disconnect cause is visible
+        console.error('❌ Connection closed:', {
+          code,
+          reason: lastDisconnect?.error?.output?.payload?.message,
+          message: lastDisconnect?.error?.message
+        });
+
+        // 🚪 Logged out — auth invalid, do NOT loop reconnect
+        if (code === DisconnectReason.loggedOut) {
+          console.log('🚪 Logged out. Delete auth_info/ and restart to re-scan QR.');
+          return;
+        }
+
+        // ♻️ 515 = restartRequired — Baileys expects an IMMEDIATE reconnect
+        if (code === DisconnectReason.restartRequired) {
+          console.log('♻️ restartRequired — reconnecting immediately');
+          restartTimer = setTimeout(() => {
+            restartTimer = null;
+            startBot().catch(e => console.error('restart error:', e));
+          }, 1000);
+          return;
+        }
+
+        // Hard cap on rapid reconnects to avoid hammering WhatsApp
         reconnectAttempts++;
-        const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts - 1));
-        console.log(`❌ Closed (${code}). Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
-        setTimeout(startBot, delay);
-      } else {
-        console.log('🚪 Logged out. Delete auth_info/ and restart.');
-      }
-    }
-  });
-
-  // ── Incoming messages ──
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
-    for (const m of messages) {
-      try {
-        if (!m.message || m.key.fromMe) continue;
-        const jid = m.key.remoteJid;
-        if (!jid) continue;
-
-        // Auto-view status
-        if (jid === 'status@broadcast') {
-          if (!FEATURES.autoViewStatus) continue;
-          const senderJid = m.key.participant;
-          if (!senderJid) continue;
-
-          const myPhone = sock.user?.id?.split(':')[0];
-          if (myPhone && senderJid.split('@')[0].split(':')[0] === myPhone) continue;
-          if (!shouldViewStatus(senderJid)) continue;
-
-          const normalized = normalizeMessageContent(m.message);
-          const hasContent = normalized?.imageMessage || normalized?.videoMessage ||
-                             normalized?.conversation || normalized?.extendedTextMessage;
-          if (!hasContent) continue;
-
-          statusQueue.push({ id: m.key.id, senderJid });
-          processStatusQueue(sock).catch(() => {});
-          continue;
+        if (reconnectAttempts > 6) {
+          console.warn('🛑 Too many reconnects — cooling down 5 min');
+          restartTimer = setTimeout(() => {
+            restartTimer = null;
+            reconnectAttempts = 0;
+            startBot().catch(e => console.error('cool-down restart error:', e));
+          }, 5 * 60 * 1000);
+          return;
         }
 
-        if (jid.endsWith('@newsletter')) continue;
-
-        storeMessage(m);
-      } catch (e) {
-        console.error('upsert handler error:', e.message);
+        const delay = Math.min(60_000, 1000 * Math.pow(2, reconnectAttempts - 1));
+        console.log(`🔁 Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+        restartTimer = setTimeout(() => {
+          restartTimer = null;
+          startBot().catch(e => console.error('reconnect error:', e));
+        }, delay);
       }
-    }
-  });
+    });
 
-  // ── Anti-delete ──
-  sock.ev.on('messages.update', async (updates) => {
-    if (!FEATURES.antiDelete) return;
-    for (const update of updates) {
-      try {
-        const isRevoke = update.update?.messageStubType === proto.WebMessageInfo.StubType.REVOKE ||
-                         update.update?.messageStubType === 1 ||
-                         update.update?.message === null;
-        if (!isRevoke) continue;
+    // ── Incoming messages ──
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
 
-        const deletedId = update.key?.id;
-        if (!deletedId) continue;
+      for (const m of messages) {
+        try {
+          if (!m.message || m.key.fromMe) continue;
+          const jid = m.key.remoteJid;
+          if (!jid) continue;
 
-        const cached = messageStore.get(deletedId);
-        if (!cached) {
-          console.log(`🗑️ Deletion detected but no cache for id=${deletedId}`);
-          continue;
+          // Auto-view status
+          if (jid === 'status@broadcast') {
+            if (!FEATURES.autoViewStatus) continue;
+            const senderJid = m.key.participant;
+            if (!senderJid) continue;
+
+            const myPhone = sock.user?.id?.split(':')[0];
+            if (myPhone && senderJid.split('@')[0].split(':')[0] === myPhone) continue;
+            if (!shouldViewStatus(senderJid)) continue;
+
+            const normalized = normalizeMessageContent(m.message);
+            const hasContent = normalized?.imageMessage || normalized?.videoMessage ||
+                               normalized?.conversation || normalized?.extendedTextMessage;
+            if (!hasContent) continue;
+
+            statusQueue.push({ id: m.key.id, senderJid });
+            processStatusQueue(sock).catch(() => {});
+            continue;
+          }
+
+          if (jid.endsWith('@newsletter')) continue;
+
+          storeMessage(m);
+        } catch (e) {
+          console.error('upsert handler error:', e.message);
         }
-
-        console.log(`🗑️ Forwarding deleted message id=${deletedId}`);
-        forwardDeleted(sock, cached.message).catch(e =>
-          console.error('anti-delete error:', e.message)
-        );
-      } catch (e) {
-        console.error('update handler error:', e.message);
       }
-    }
-  });
+    });
 
-  return sock;
+    // ── Anti-delete ──
+    sock.ev.on('messages.update', async (updates) => {
+      if (!FEATURES.antiDelete) return;
+      for (const update of updates) {
+        try {
+          const isRevoke = update.update?.messageStubType === proto.WebMessageInfo.StubType.REVOKE ||
+                           update.update?.messageStubType === 1 ||
+                           update.update?.message === null;
+          if (!isRevoke) continue;
+
+          const deletedId = update.key?.id;
+          if (!deletedId) continue;
+
+          const cached = messageStore.get(deletedId);
+          if (!cached) {
+            console.log(`🗑️ Deletion detected but no cache for id=${deletedId}`);
+            continue;
+          }
+
+          console.log(`🗑️ Forwarding deleted message id=${deletedId}`);
+          forwardDeleted(sock, cached.message).catch(e =>
+            console.error('anti-delete error:', e.message)
+          );
+        } catch (e) {
+          console.error('update handler error:', e.message);
+        }
+      }
+    });
+
+  } finally {
+    starting = false;
+  }
 }
 
-process.on('SIGINT',  () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+// ═══════════════════════════════════════════════════════════
+// 6b. WATCHDOG  (catches silent socket deaths on free hosts)
+// ═══════════════════════════════════════════════════════════
+setInterval(() => {
+  if (!botConnected && !starting && !restartTimer) {
+    console.warn('⏰ Watchdog: not connected — restarting bot');
+    startBot().catch(e => console.error('watchdog restart error:', e));
+  }
+}, 60_000);
+
+// ═══════════════════════════════════════════════════════════
+// 7. SHUTDOWN
+// ═══════════════════════════════════════════════════════════
+process.on('SIGINT',  () => {
+  try { activeSock?.end(undefined); } catch {}
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  try { activeSock?.end(undefined); } catch {}
+  process.exit(0);
+});
 
 startBot().catch(e => {
   console.error('Fatal startup error:', e);
