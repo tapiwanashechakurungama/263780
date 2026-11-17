@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WhatsApp Bot — Final (Web QR + Self-Ping + Auto-View + Anti-Delete)
+// WhatsApp Bot — Final (Web QR + Self-Ping + Auto-View + Anti-Delete + View-Once Capture)
 // ═══════════════════════════════════════════════════════════
 const {
   default: makeWASocket,
@@ -33,9 +33,10 @@ const NASHY_PHONE = '263733517788';
 const NASHY_JID   = `${NASHY_PHONE}@s.whatsapp.net`;
 
 const FEATURES = {
-  autoViewStatus: process.env.AUTO_VIEW_STATUS !== 'off',
-  antiDelete:     process.env.ANTI_DELETE      !== 'off',
-  statusReact:    process.env.STATUS_REACT     === 'on'
+  autoViewStatus:  process.env.AUTO_VIEW_STATUS  !== 'off',
+  antiDelete:      process.env.ANTI_DELETE       !== 'off',
+  statusReact:     process.env.STATUS_REACT      === 'on',
+  viewOnceCapture: process.env.VIEW_ONCE_CAPTURE !== 'off'
 };
 
 const STORE_TTL_MS      = 24 * 60 * 60 * 1000;
@@ -178,6 +179,76 @@ async function forwardDeleted(sock, original) {
   } catch (e) {
     console.error('anti-delete forward failed:', e.message);
     try { await sock.sendMessage(NASHY_JID, { text: `⚠️ Could not forward media: ${e.message}` }); } catch {}
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3b. VIEW-ONCE CAPTURE
+// ═══════════════════════════════════════════════════════════
+const VIEW_ONCE_WRAPPERS = ['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension'];
+
+function hasViewOnceWrapper(message) {
+  if (!message) return false;
+  if (VIEW_ONCE_WRAPPERS.some(k => message[k])) return true;
+  // view-once nested inside a disappearing-messages wrapper
+  const eph = message.ephemeralMessage?.message;
+  return !!eph && VIEW_ONCE_WRAPPERS.some(k => eph[k]);
+}
+
+function getViewOnceMedia(m) {
+  const normalized = normalizeMessageContent(m.message);
+  if (!normalized) return null;
+
+  const type = ['imageMessage', 'videoMessage', 'audioMessage'].find(t => normalized[t]);
+  if (!type) return null;
+
+  const inner = normalized[type];
+  // Older Baileys: wrapper message. Newer: `viewOnce: true` flag on the media itself.
+  if (!hasViewOnceWrapper(m.message) && !inner.viewOnce) return null;
+
+  return { type, inner, normalized };
+}
+
+async function captureViewOnce(sock, m) {
+  if (!FEATURES.viewOnceCapture) return;
+
+  const found = getViewOnceMedia(m);
+  if (!found) return;
+
+  const { type, inner, normalized } = found;
+  const senderPhone = await getSenderPhone(sock, m);
+  const senderName  = getSenderName(m);
+  const chatJid     = m.key.remoteJid;
+  const isGroup     = chatJid?.endsWith('@g.us');
+
+  const kind = type === 'imageMessage' ? 'photo' : type === 'videoMessage' ? 'video' : 'voice note';
+  const header = isGroup
+    ? `👁️ *View-once ${kind} (group)*\n\n👤 ${senderName}\n📱 +${senderPhone}\n👥 ${chatJid.split('@')[0]}`
+    : `👁️ *View-once ${kind}*\n\n👤 ${senderName}\n📱 +${senderPhone}`;
+
+  try {
+    const buffer = await downloadMediaMessage(
+      { ...m, message: normalized }, 'buffer', {},
+      { logger: LOGGER, reuploadRequest: sock.updateMediaMessage }
+    );
+
+    await sock.sendMessage(NASHY_JID, { text: header });
+
+    if (type === 'imageMessage') {
+      await sock.sendMessage(NASHY_JID, { image: buffer, caption: inner.caption || '' });
+    } else if (type === 'videoMessage') {
+      await sock.sendMessage(NASHY_JID, { video: buffer, caption: inner.caption || '' });
+    } else {
+      await sock.sendMessage(NASHY_JID, {
+        audio: buffer,
+        mimetype: inner.mimetype || 'audio/ogg; codecs=opus',
+        ptt: inner.ptt ?? true
+      });
+    }
+    console.log(`👁️ Captured view-once ${kind} from +${senderPhone}`);
+  } catch (e) {
+    console.error('view-once capture failed:', e.message);
+    try { await sock.sendMessage(NASHY_JID, { text: `${header}\n\n⚠️ Could not download: ${e.message}` }); } catch {}
   }
 }
 
@@ -328,6 +399,8 @@ async function startBot() {
   botStartedAt = Date.now();
 
   try {
+    // Increment generation BEFORE touching the old socket — its close event
+    // will now be ignored by the generation check.
     socketGeneration++;
     const myGen = socketGeneration;
 
@@ -345,11 +418,9 @@ async function startBot() {
       logger: LOGGER,
       markOnlineOnConnect: true,
       syncFullHistory: false,
-      // 🔧 FIX: Only reject FULL history sync. Rejecting all sync types
-      //    except "2" can prevent LID mappings from populating, which
-      //    silently drops inbound messages (one-gray-tick symptom).
-      shouldSyncHistoryMessage: ({ syncType }) =>
-        syncType !== proto.HistorySync.HistorySyncType.FULL
+      // (browser config intentionally omitted — hardcoded values can be
+      //  rejected by WhatsApp and cause an immediate close right after QR)
+      shouldSyncHistoryMessage: ({ syncType }) => syncType !== 2
     });
 
     activeSock = sock;
@@ -357,7 +428,11 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (u) => {
-      if (myGen !== socketGeneration) return;
+      // ── Ignore events from stale sockets ──
+      if (myGen !== socketGeneration) {
+        console.log(`🚫 Ignoring update from stale socket gen=${myGen} (current=${socketGeneration})`);
+        return;
+      }
 
       const { connection, lastDisconnect, qr } = u;
 
@@ -365,7 +440,7 @@ async function startBot() {
         currentQR = qr;
         qrEmittedAt = Date.now();
         botConnected = false;
-        reconnectAttempts = 0;
+        reconnectAttempts = 0; // QR refresh is normal — not a failure
         console.log(`📱 QR ready (gen=${myGen}) — open /qr in browser to scan`);
         if (!process.env.RENDER) qrcode.generate(qr, { small: true });
       }
@@ -401,12 +476,14 @@ async function startBot() {
           message: lastDisconnect?.error?.message
         });
 
+        // 🚪 Logged out — truly stop, do not loop
         if (code === DisconnectReason.loggedOut) {
           permanentlyStopped = true;
           console.log('🚪 Logged out. Delete auth_info/ and restart to re-scan QR.');
           return;
         }
 
+        // ♻️ 515 restartRequired — reconnect fast, no backoff
         if (code === DisconnectReason.restartRequired) {
           console.log('♻️ restartRequired — reconnecting immediately');
           restartTimer = setTimeout(() => {
@@ -416,6 +493,9 @@ async function startBot() {
           return;
         }
 
+        // 📱 QR phase — give the user time to scan, do NOT use backoff yet.
+        //    5s delay between QR refreshes = plenty of time to scan, and
+        //    slow enough to avoid WhatsApp rate-limiting.
         if (!hasEverAuthenticated) {
           console.log('📱 QR phase — reconnecting in 5s to refresh QR');
           restartTimer = setTimeout(() => {
@@ -425,6 +505,7 @@ async function startBot() {
           return;
         }
 
+        // 🔁 Post-auth — normal exponential backoff
         reconnectAttempts++;
         if (reconnectAttempts > 6) {
           console.warn('🛑 Too many reconnects — cooling down 5 min');
@@ -452,42 +533,10 @@ async function startBot() {
 
       for (const m of messages) {
         try {
-          if (!m.message) continue;
-
-          // 🔧 FIX: Log EVERY incoming message BEFORE any filter, so you can
-          //    confirm whether the message actually reaches the handler.
-          console.log('📨 incoming:', {
-            fromMe: m.key.fromMe,
-            jid: m.key.remoteJid,
-            id: m.key.id,
-            type: Object.keys(m.message)[0]
-          });
-
-          // 🔧 FIX: Do not filter on `m.key.fromMe` alone — a Baileys bug can
-          //    deliver messages from other numbers with fromMe=true, causing
-          //    them to be dropped silently. Filter by remoteJid instead.
+          if (!m.message || m.key.fromMe) continue;
           const jid = m.key.remoteJid;
           if (!jid) continue;
-          const myJid = sock.user?.id;
-          if (myJid && jid === myJid) continue;
 
-          // ── Send delivery receipt (second gray tick) ──
-          // Baileys 7.x dispatches receipts internally after decryption, but
-          // if your socket was in a stale state when the message arrived, the
-          // internal dispatch can be skipped. Sending explicitly here guarantees
-          // the sender sees the second tick.
-          try {
-            await sock.sendReceipt(
-              jid,
-              m.key.participant || undefined,
-              [m.key.id],
-              'delivery'
-            );
-          } catch (e) {
-            console.error('delivery receipt failed:', e.message);
-          }
-
-          // Auto-view status
           if (jid === 'status@broadcast') {
             if (!FEATURES.autoViewStatus) continue;
             const senderJid = m.key.participant;
@@ -508,6 +557,9 @@ async function startBot() {
           }
 
           if (jid.endsWith('@newsletter')) continue;
+
+          // Capture view-once media immediately (not awaited so downloads never block other messages)
+          captureViewOnce(sock, m).catch(e => console.error('view-once error:', e.message));
 
           storeMessage(m);
         } catch (e) {
@@ -552,11 +604,13 @@ async function startBot() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 6b. WATCHDOG (with grace period)
+// 6b. WATCHDOG (with grace period so it can't kill initial connect)
 // ═══════════════════════════════════════════════════════════
 setInterval(() => {
   if (permanentlyStopped) return;
   if (botConnected || starting || restartTimer) return;
+  // Do not fire for the first 2 minutes after the last startBot() — gives
+  // slow free-tier hosts time to establish the socket without interference.
   if (botStartedAt && Date.now() - botStartedAt < 120_000) return;
 
   console.warn('⏰ Watchdog: not connected — restarting bot');
