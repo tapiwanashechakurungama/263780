@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// WhatsApp Bot — Final (Web QR + Self-Ping + Auto-View + Anti-Delete + View-Once Capture)
+// WhatsApp Bot — Final (Web QR + Self-Ping + Auto-View + Anti-Delete + View-Once Capture + !vo command)
 // ═══════════════════════════════════════════════════════════
 const {
   default: makeWASocket,
@@ -45,6 +45,12 @@ const STATUS_MIN_DELAY  = 2000;
 const STATUS_MAX_DELAY  = 5000;
 const STATUS_BLACKLIST  = new Set([]);
 const STATUS_REACT_EMOJIS = ['🔥','❤️','👏','💯','🙌','😂','😮','✨'];
+
+// How many captured view-once items to keep around for the !vo command,
+// and for how long, before they're dropped from memory.
+const VIEWONCE_MAX_ENTRIES = 50;
+const VIEWONCE_TTL_MS      = 24 * 60 * 60 * 1000;
+const VIEWONCE_PAGE_SIZE   = 10;
 
 const SELF_PING_INTERVAL_MS = 10 * 60 * 1000;
 const SELF_PING_URL = process.env.SELF_PING_URL ||
@@ -109,6 +115,25 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════════
+// 1b. VIEW-ONCE STORE (backs the !vo save/retrieve command)
+// ═══════════════════════════════════════════════════════════
+const viewOnceStore = new Map(); // id -> { buffer, type, kind, caption, mimetype, ptt, senderName, senderPhone, isGroup, groupId, capturedAt }
+
+function storeViewOnceItem(id, item) {
+  viewOnceStore.set(id, item);
+
+  if (viewOnceStore.size > VIEWONCE_MAX_ENTRIES) {
+    const sorted = [...viewOnceStore.entries()].sort((a, b) => a[1].capturedAt - b[1].capturedAt);
+    for (const [oldId] of sorted.slice(0, sorted.length - VIEWONCE_MAX_ENTRIES)) viewOnceStore.delete(oldId);
+  }
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - VIEWONCE_TTL_MS;
+  for (const [id, item] of viewOnceStore) if (item.capturedAt < cutoff) viewOnceStore.delete(id);
+}, 10 * 60 * 1000);
+
+// ═══════════════════════════════════════════════════════════
 // 2. HELPERS
 // ═══════════════════════════════════════════════════════════
 async function getSenderPhone(sock, msg) {
@@ -129,6 +154,11 @@ async function getSenderPhone(sock, msg) {
 
 function getSenderName(msg) {
   return msg.pushName || 'Unknown';
+}
+
+function getTextContent(m) {
+  const normalized = normalizeMessageContent(m.message);
+  return normalized?.conversation || normalized?.extendedTextMessage?.text || '';
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -209,6 +239,10 @@ function getViewOnceMedia(m) {
   return { type, inner, normalized };
 }
 
+function kindLabel(type) {
+  return type === 'imageMessage' ? 'photo' : type === 'videoMessage' ? 'video' : 'voice note';
+}
+
 async function captureViewOnce(sock, m) {
   if (!FEATURES.viewOnceCapture) return;
 
@@ -220,8 +254,8 @@ async function captureViewOnce(sock, m) {
   const senderName  = getSenderName(m);
   const chatJid     = m.key.remoteJid;
   const isGroup     = chatJid?.endsWith('@g.us');
+  const kind        = kindLabel(type);
 
-  const kind = type === 'imageMessage' ? 'photo' : type === 'videoMessage' ? 'video' : 'voice note';
   const header = isGroup
     ? `👁️ *View-once ${kind} (group)*\n\n👤 ${senderName}\n📱 +${senderPhone}\n👥 ${chatJid.split('@')[0]}`
     : `👁️ *View-once ${kind}*\n\n👤 ${senderName}\n📱 +${senderPhone}`;
@@ -231,6 +265,21 @@ async function captureViewOnce(sock, m) {
       { ...m, message: normalized }, 'buffer', {},
       { logger: LOGGER, reuploadRequest: sock.updateMediaMessage }
     );
+
+    // Keep a copy in memory so it can be pulled back up later with !vo
+    storeViewOnceItem(m.key.id || `${Date.now()}-${Math.random()}`, {
+      buffer,
+      type,
+      kind,
+      caption: inner.caption || '',
+      mimetype: inner.mimetype || (type === 'audioMessage' ? 'audio/ogg; codecs=opus' : undefined),
+      ptt: inner.ptt ?? true,
+      senderName,
+      senderPhone,
+      isGroup,
+      groupId: isGroup ? chatJid.split('@')[0] : null,
+      capturedAt: Date.now()
+    });
 
     await sock.sendMessage(NASHY_JID, { text: header });
 
@@ -250,6 +299,82 @@ async function captureViewOnce(sock, m) {
     console.error('view-once capture failed:', e.message);
     try { await sock.sendMessage(NASHY_JID, { text: `${header}\n\n⚠️ Could not download: ${e.message}` }); } catch {}
   }
+}
+
+// ═══════════════════════════════════════════════════════════
+// 3c. OWNER COMMANDS (!vo — resend saved view-once media)
+// ═══════════════════════════════════════════════════════════
+async function resendViewOnceItem(sock, chatJid, item) {
+  try {
+    const header = `👁️ *Saved view-once ${item.kind}*\n\n👤 ${item.senderName}\n📱 +${item.senderPhone}` +
+      (item.isGroup ? `\n👥 ${item.groupId}` : '') +
+      `\n🕒 ${new Date(item.capturedAt).toLocaleString()}`;
+
+    await sock.sendMessage(chatJid, { text: header });
+
+    if (item.type === 'imageMessage') {
+      await sock.sendMessage(chatJid, { image: item.buffer, caption: item.caption || '' });
+    } else if (item.type === 'videoMessage') {
+      await sock.sendMessage(chatJid, { video: item.buffer, caption: item.caption || '' });
+    } else {
+      await sock.sendMessage(chatJid, {
+        audio: item.buffer,
+        mimetype: item.mimetype || 'audio/ogg; codecs=opus',
+        ptt: item.ptt ?? true
+      });
+    }
+  } catch (e) {
+    console.error('resend view-once failed:', e.message);
+    try { await sock.sendMessage(chatJid, { text: `⚠️ Could not resend: ${e.message}` }); } catch {}
+  }
+}
+
+async function handleViewOnceCommand(sock, chatJid, args) {
+  if (viewOnceStore.size === 0) {
+    await sock.sendMessage(chatJid, { text: 'ℹ️ No view-once media captured yet.' });
+    return;
+  }
+
+  // Most recent first
+  const items = [...viewOnceStore.values()].sort((a, b) => b.capturedAt - a.capturedAt);
+  const sub = (args[0] || '').toLowerCase();
+
+  if (sub === 'list') {
+    const lines = items.slice(0, VIEWONCE_PAGE_SIZE).map((it, i) =>
+      `${i + 1}. ${it.kind} from +${it.senderPhone} — ${new Date(it.capturedAt).toLocaleString()}`
+    );
+    await sock.sendMessage(chatJid, {
+      text: `👁️ *Recent view-once captures* (${items.length} total):\n\n${lines.join('\n')}\n\nSend *!vo <number>* to resend one, or just *!vo* for the latest.`
+    });
+    return;
+  }
+
+  let index = 0; // default: most recent capture
+  if (sub && /^\d+$/.test(sub)) {
+    index = parseInt(sub, 10) - 1;
+    if (index < 0 || index >= items.length) {
+      await sock.sendMessage(chatJid, { text: `⚠️ No item #${sub}. Send *!vo list* to see what's available (${items.length} saved).` });
+      return;
+    }
+  }
+
+  await resendViewOnceItem(sock, chatJid, items[index]);
+}
+
+async function handleOwnerCommand(sock, m) {
+  const text = getTextContent(m).trim();
+  if (!text.startsWith('!')) return;
+
+  const chatJid = m.key.remoteJid;
+  if (!chatJid) return;
+
+  const [rawCmd, ...args] = text.slice(1).trim().split(/\s+/);
+  const cmd = (rawCmd || '').toLowerCase();
+
+  if (cmd === 'vo' || cmd === 'viewonce') {
+    await handleViewOnceCommand(sock, chatJid, args);
+  }
+  // Add more owner commands here, e.g. "antidelete", "status" toggles.
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -320,6 +445,7 @@ app.get('/health', (req, res) => {
     connected: botConnected,
     uptime: process.uptime(),
     storeSize: messageStore.size,
+    viewOnceStoreSize: viewOnceStore.size,
     features: FEATURES,
     timestamp: new Date().toISOString()
   });
@@ -533,9 +659,15 @@ async function startBot() {
 
       for (const m of messages) {
         try {
-          if (!m.message || m.key.fromMe) continue;
+          if (!m.message) continue;
           const jid = m.key.remoteJid;
           if (!jid) continue;
+
+          // ── Owner commands (messages YOU send from your own linked number) ──
+          if (m.key.fromMe) {
+            await handleOwnerCommand(sock, m).catch(e => console.error('command error:', e.message));
+            continue;
+          }
 
           if (jid === 'status@broadcast') {
             if (!FEATURES.autoViewStatus) continue;
