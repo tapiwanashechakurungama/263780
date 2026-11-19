@@ -47,7 +47,7 @@ const STATUS_BLACKLIST  = new Set([]);
 const STATUS_REACT_EMOJIS = ['🔥','❤️','👏','💯','🙌','😂','😮','✨'];
 
 // How many captured view-once items to keep around for the !vo command,
-// and for how long, before they're dropped from memory.
+// and for how long, before they're dropped from memory trynna
 const VIEWONCE_MAX_ENTRIES = 50;
 const VIEWONCE_TTL_MS      = 24 * 60 * 60 * 1000;
 const VIEWONCE_PAGE_SIZE   = 10;
